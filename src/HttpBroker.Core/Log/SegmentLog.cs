@@ -14,6 +14,7 @@ namespace HttpBroker.Core.Log;
 /// </summary>
 public sealed class SegmentLog : IDisposable
 {
+    private static readonly TimeSpan FlushInterval = TimeSpan.FromMilliseconds(50);
     private const string SegFilePattern = "seg-*.log";
 
     private readonly string _dir;
@@ -21,6 +22,8 @@ public sealed class SegmentLog : IDisposable
     private readonly object _lock = new();
     private readonly List<Segment> _segments = new();
     private long _nextOffset;
+    private CancellationTokenSource _cts = new();
+    private Task _flushLoop = Task.CompletedTask;
 
     public string Topic { get; }
 
@@ -51,6 +54,7 @@ public sealed class SegmentLog : IDisposable
 
         log._segments[^1].IsActive = true;
         log._nextOffset = log._segments[^1].EndOffset;
+        log._flushLoop = Task.Run(log.FlushLoopAsync);
         return log;
     }
 
@@ -169,12 +173,44 @@ public sealed class SegmentLog : IDisposable
         throw new InvalidOperationException($"Topic '{Topic}': offset {offset} not found.");
     }
 
+    private async Task FlushLoopAsync()
+    {
+        using var timer = new PeriodicTimer(FlushInterval);
+        while (!_cts.IsCancellationRequested)
+        {
+            await timer.WaitForNextTickAsync(_cts.Token);
+            try
+            {
+                lock (_lock)
+                {
+                    if (_config.Durability == DurabilityMode.Fsync) continue; // already flushed per batch
+                    foreach (var seg in _segments)
+                        seg.Flush(fsync: false);
+                }
+            }
+            catch (ObjectDisposedException) { return; }
+            catch (Exception) { /* ignore transient IO errors; retry next tick */ }
+        }
+    }
+
+    public void FlushFinal()
+    {
+        lock (_lock)
+        {
+            foreach (var seg in _segments)
+                seg.Flush(fsync: false);
+        }
+    }
+
     public void Dispose()
     {
+        _cts.Cancel();
+        try { _flushLoop.Wait(TimeSpan.FromSeconds(2)); } catch { /* noop */ }
         lock (_lock)
         {
             foreach (var seg in _segments)
                 seg.Dispose();
         }
+        _cts.Dispose();
     }
 }
