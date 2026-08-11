@@ -141,7 +141,7 @@ public sealed class SegmentLog : IDisposable
     private (Segment, int)[] BuildReadPlan(long start, long endExclusive)
     {
         if (start < OldestOffset)
-            throw new InvalidOperationException($"Topic '{Topic}': offset {start} is older than the oldest readable offset {OldestOffset}.");
+            throw new OffsetExpiredException(Topic, OldestOffset, start);
 
         var plan = new List<(Segment, int)>();
         foreach (var seg in _segments)
@@ -170,7 +170,27 @@ public sealed class SegmentLog : IDisposable
             }
         }
 
-        throw new InvalidOperationException($"Topic '{Topic}': offset {offset} not found.");
+        throw new OffsetExpiredException(Topic, OldestOffset, offset);
+    }
+
+    /// <summary>Enforce retention: drop the oldest closed segment while over budget.</summary>
+    public void Sweep()
+    {
+        lock (_lock)
+        {
+            while (_segments.Count > 1)
+            {
+                var total = _segments.Where(s => !s.IsActive).Sum(s => s.SizeBytes);
+                var oldest = _segments[0];
+                var overAge = _config.Retention.MaxAge is { } age &&
+                              (DateTimeOffset.UtcNow - oldest.LastWriteUtc) > age;
+                var overBytes = total > _config.Retention.MaxBytes;
+                if (!overAge && !overBytes) break;
+
+                oldest.CloseAndDelete();
+                _segments.RemoveAt(0);
+            }
+        }
     }
 
     private async Task FlushLoopAsync()
@@ -213,4 +233,14 @@ public sealed class SegmentLog : IDisposable
         }
         _cts.Dispose();
     }
+}
+
+/// <summary>The requested offset is gone (retention deleted it). Caller should rewind
+/// to <see cref="OldestOffset"/> — replay from the oldest surviving record.</summary>
+public sealed class OffsetExpiredException(string topic, long oldestOffset, long requested)
+    : Exception($"Topic '{topic}': offset {requested} expired; oldest survivable offset is {oldestOffset}.")
+{
+    public string Topic { get; } = topic;
+    public long OldestOffset { get; } = oldestOffset;
+    public long Requested { get; } = requested;
 }
