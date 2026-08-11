@@ -1,0 +1,12 @@
+# build output
+bin/
+obj/
+*.user
+
+# broker data
+data/
+
+# IDE
+.vs/
+.idea/
+*.swp
