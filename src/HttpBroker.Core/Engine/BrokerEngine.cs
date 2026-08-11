@@ -1,14 +1,56 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Threading.Channels;
 using HttpBroker.Core.Groups;
 using HttpBroker.Core.Log;
 using HttpBroker.Core.Model;
 
 namespace HttpBroker.Core.Engine;
 
+/// <summary>A live consumer stream attached to a topic. Fills with messages appended
+/// after subscription; overflow (slow consumer) is signaled via <see cref="Overflowed"/>,
+/// which the HTTP layer turns into "replay from your last committed offset".</summary>
+public sealed class ConsumerSubscription
+{
+    internal readonly System.Threading.Channels.Channel<BrokerMessage> ChannelInternal =
+        System.Threading.Channels.Channel.CreateBounded<BrokerMessage>(new BoundedChannelOptions(capacity: 4096)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait, // TryWrite must win this
+        });
+
+    /// <summary>The fan-out pipe the HTTP layer drains; bounded, so a slow consumer
+    /// trips <see cref="Overflowed"/> instead of silently dropping messages.</summary>
+    public System.Threading.Channels.ChannelReader<BrokerMessage> Channel => ChannelInternal.Reader;
+
+    /// <summary>End offset captured at subscribe time. Replay reads [requested, EndOffset),
+    /// then the channel delivers everything appended after.</summary>
+    public long EndOffset { get; internal set; }
+
+    private volatile bool _overflowed;
+
+    /// <summary>True once a slow consumer let the channel fill and the broker refused
+    /// to drop data — reconnect from your committed offset.</summary>
+    public bool Overflowed => _overflowed;
+
+    internal bool TryDeliver(BrokerMessage message)
+    {
+        // Writer side raced: bounded channel full => consumer too slow.
+        if (ChannelInternal.Writer.TryWrite(message)) return true;
+        _overflowed = true;
+        return false;
+    }
+
+    internal void Close()
+    {
+        if (!_overflowed) ChannelInternal.Writer.TryComplete();
+    }
+}
+
 /// <summary>
-/// The broker core: topics, segment logs, offsets. Single node for now —
-/// replication is a later milestone.
+/// The broker core: topics, segment logs, fan-out to streaming consumers, offsets.
+/// Single node for now — replication is a later milestone.
 /// </summary>
 public sealed class BrokerEngine : IAsyncDisposable
 {
@@ -24,6 +66,7 @@ public sealed class BrokerEngine : IAsyncDisposable
         public TopicConfig Config { get; set; } = config;
         public SegmentLog Log { get; } = log;
         public readonly object FanoutLock = new();
+        public readonly List<ConsumerSubscription> Subs = new();
     }
 
     public BrokerEngine(string dataDir)
@@ -87,6 +130,67 @@ public sealed class BrokerEngine : IAsyncDisposable
         => _topics.TryGetValue(topic, out var state) ? state.Config : null;
 
     public IReadOnlyList<string> Topics => _topics.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
+
+    /// <summary>Produce a batch. Offsets are assigned atomically under the topic's fan-out
+    /// lock so fan-out order always matches log order.</summary>
+    public (long First, long Last) Produce(string topic, IReadOnlyList<byte[]> payloads)
+    {
+        if (payloads.Count == 0) throw new ArgumentException("Batch must contain at least one message.");
+
+        var state = GetOrCreate(topic);
+        var timestamp = DateTimeOffset.UtcNow;
+
+        lock (state.FanoutLock)
+        {
+            var (first, last) = state.Log.Append(payloads, timestamp);
+
+            // Fan-out only pays when someone is listening (and the bench/preload case is
+            // producer-only). With no subscribers, skip the read-back entirely.
+            if (state.Subs.Count > 0)
+            {
+                for (long off = first; off <= last; off++)
+                {
+                    var message = state.Log.ReadSingle(off);
+                    foreach (var sub in state.Subs)
+                        sub.TryDeliver(message);
+                }
+            }
+
+            return (first, last);
+        }
+    }
+
+    /// <summary>Attach a streaming consumer. Replay [requestedOffset, EndOffset) from the log,
+    /// then drain the channel. Register-under-lock + capture-after guarantees no gaps or dupes:
+    /// anything appended before registration is in the log range; anything after is on the channel.</summary>
+    public ConsumerSubscription Subscribe(string topic)
+    {
+        var state = GetOrCreate(topic);
+        var sub = new ConsumerSubscription();
+        lock (state.FanoutLock)
+        {
+            state.Subs.Add(sub);
+            sub.EndOffset = state.Log.NextOffset;
+        }
+        return sub;
+    }
+
+    public void Unsubscribe(string topic, ConsumerSubscription sub)
+    {
+        if (!_topics.TryGetValue(topic, out var state)) return;
+        lock (state.FanoutLock)
+        {
+            state.Subs.Remove(sub);
+            sub.Close();
+        }
+    }
+
+    public IAsyncEnumerable<BrokerMessage> ReadReplayAsync(string topic, long startOffset, long endOffsetExclusive,
+        CancellationToken ct = default)
+    {
+        var state = GetOrCreate(topic);
+        return state.Log.ReadRangeAsync(startOffset, endOffsetExclusive, ct);
+    }
 
     public long EndOffset(string topic)
         => _topics.TryGetValue(topic, out var state) ? state.Log.NextOffset : 0;
