@@ -111,6 +111,8 @@ public sealed class SegmentLog : IDisposable
 
             if (_config.Durability == DurabilityMode.Fsync)
                 active.Flush(fsync: true);
+            else
+                active.Flush(fsync: false); // push buffered bytes to the OS so readers see them
 
             return (first, _nextOffset - 1);
         }
