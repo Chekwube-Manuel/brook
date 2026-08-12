@@ -21,6 +21,8 @@ public sealed class BrokerClient : IDisposable
         _ownsHttp = http is null;
         Http = http ?? new HttpClient();
         Http.BaseAddress = new Uri(baseUrl.EndsWith('/') ? baseUrl : baseUrl + "/");
+        Http.DefaultRequestVersion = System.Net.HttpVersion.Version20;
+        Http.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
         Http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         Http.Timeout = Timeout.InfiniteTimeSpan; // streams stay open
     }
