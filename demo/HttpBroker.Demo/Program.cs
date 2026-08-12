@@ -7,6 +7,7 @@ namespace HttpBroker.Demo;
 /// <summary>Demo CLI. Commands:
 ///   serve    --urls http://host:port --data ./data        run the broker
 ///   produce  --url ... --topic demo --count 1000          push text messages
+///   consume  --url ... --topic demo --group g1            print + commit, at-least-once
 /// </summary>
 public static class Program
 {
@@ -25,6 +26,7 @@ public static class Program
             {
                 "serve" => await ServeAsync(),
                 "produce" => await ProduceAsync(),
+                "consume" => await ConsumeAsync(),
                 _ => PrintUsage(),
             };
         }
@@ -89,12 +91,63 @@ public static class Program
         return 0;
     }
 
+    // ---------- consume ----------
+
+    private static async Task<int> ConsumeAsync()
+    {
+        using var client = new BrokerClient(Opt("url", "http://127.0.0.1:8123"));
+        var topic = Opt("topic", "demo");
+        var group = Opt("group", "g1");
+        var commitEvery = OptInt("commit-every", 100);
+        var print = Opt("print", "true") != "false";
+
+        var committed = await client.GetCommittedOffsetAsync(group, topic);
+        Console.WriteLine($"[consumer] group '{group}' resuming from offset {committed} on '{topic}'. Ctrl+C to stop.");
+
+        long last = committed;
+        long seen = 0;
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        while (!cts.IsCancellationRequested)
+        {
+            try
+            {
+                await using var stream = await client.OpenStreamAsync(topic, group, last, cts.Token);
+                while (true)
+                {
+                    var msg = await stream.NextAsync(cts.Token);
+                    if (msg is null) break; // broker closed the stream gracefully
+                    last = msg.Offset + 1;
+                    seen++;
+                    if (print && seen <= 20)
+                        Console.WriteLine($"  [{msg.Offset}] {msg.Payload}");
+                    if (commitEvery > 0 && seen % commitEvery == 0)
+                        await client.CommitOffsetAsync(group, topic, last);
+                }
+            }
+            catch (ResetException)
+            {
+                // Slow-consumer reset: replay from committed offset. At-least-once in action.
+                committed = await client.GetCommittedOffsetAsync(group, topic);
+                last = committed;
+                Console.WriteLine($"  [!] stream reset (channel overflow) - replaying from {committed}");
+            }
+            catch (OperationCanceledException) { break; }
+        }
+
+        await client.CommitOffsetAsync(group, topic, last);
+        Console.WriteLine($"[consumer] done. saw {seen} messages, committed offset {last}");
+        return 0;
+    }
+
     private static int PrintUsage()
     {
         Console.WriteLine("""
             HttpBroker demo
               serve    --urls http://127.0.0.1:8123 --data ./data
               produce  --url http://127.0.0.1:8123 --topic demo --count 1000 [--size 64]
+              consume  --url http://127.0.0.1:8123 --topic demo --group g1 [--commit-every 100]
             """);
         return 1;
     }
