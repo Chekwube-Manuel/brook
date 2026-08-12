@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\HttpBroker.Client\HttpBroker.Client.csproj" />
+    <ProjectReference Include="..\..\src\HttpBroker.Server\HttpBroker.Server.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
