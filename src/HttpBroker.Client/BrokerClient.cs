@@ -51,6 +51,17 @@ public sealed class BrokerClient : IDisposable
         return JsonSerializer.Deserialize<ProduceResult>(await resp.Content.ReadAsStringAsync(ct), Json.Options)!;
     }
 
+    /// <summary>Open a consume stream. The returned reader adapts the NDJSON response;
+    /// the broker keeps the connection open and pushes as new messages arrive.</summary>
+    public Task<ConsumerStream> OpenStreamAsync(string topic, string? group = null, long? offset = null, CancellationToken ct = default)
+    {
+        var query = new List<string>();
+        if (group is not null) query.Add($"group={Uri.EscapeDataString(group)}");
+        if (offset is not null) query.Add($"offset={offset}");
+        var qs = query.Count > 0 ? "?" + string.Join("&", query) : "";
+        return ConsumerStream.OpenAsync(Http, $"/v1/topics/{Uri.EscapeDataString(topic)}/stream{qs}", ct);
+    }
+
     /// <summary>Commit the next offset a group should consume. At-least-once lives here:
     /// commit AFTER you have durably (idempotently) processed the message.</summary>
     public async Task CommitOffsetAsync(string group, string topic, long nextOffset, CancellationToken ct = default)
