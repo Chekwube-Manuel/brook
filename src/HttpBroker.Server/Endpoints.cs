@@ -12,10 +12,17 @@ namespace HttpBroker.Server;
 ///   GET  /v1/topics/{topic}/stream?group=&offset=  consume (HTTP/2 server-stream)
 ///   PUT  /v1/groups/{group}/topics/{topic}/offset  commit offset
 ///   GET  /v1/groups/{group}/topics/{topic}/offset  read committed offset
+///   PUT  /v1/topics/{topic}                        create/update topic config
+///   GET  /v1/topics  ·  GET /v1/topics/{topic}     admin
 ///   GET  /healthz
 /// </summary>
 public static class Endpoints
 {
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
     public static void Map(WebApplication app)
     {
         app.MapGet("/healthz", () => Results.Text("ok"));
@@ -23,6 +30,10 @@ public static class Endpoints
         app.MapGet("/v1/topics/{topic}/stream", Stream);
         app.MapPut("/v1/groups/{group}/topics/{topic}/offset", CommitOffset);
         app.MapGet("/v1/groups/{group}/topics/{topic}/offset", ReadOffset);
+        app.MapPut("/v1/topics/{topic}", ConfigureTopic);
+        app.MapGet("/v1/topics", ListTopics);
+        app.MapGet("/v1/topics/{topic}", DescribeTopic);
+        app.MapPost("/v1/admin/sweep", SweepNow);
     }
 
     // ---------- produce ----------
@@ -171,6 +182,77 @@ public static class Endpoints
         }
         catch (ArgumentException ex) { await Error(ctx, 400, ex.Message); }
         catch (Exception ex) { await Error(ctx, 500, ex.Message); }
+    }
+
+    // ---------- admin ----------
+
+    private static async Task ConfigureTopic(HttpContext ctx, string topic, BrokerEngine engine)
+    {
+        try
+        {
+            BrokerEngine.ValidateName(topic, "topic");
+            TopicConfig? cfg = null;
+            if (ctx.Request.ContentLength is > 0 or null)
+            {
+                try
+                {
+                    cfg = await JsonSerializer.DeserializeAsync<TopicConfig>(ctx.Request.Body, JsonOpts);
+                }
+                catch (JsonException) { /* empty body => defaults */ }
+            }
+
+            var effective = engine.ConfigureTopic(topic, cfg ?? TopicConfig.Default(topic));
+            await Results.Json(new
+            {
+                topic,
+                durability = effective.Durability.ToString(),
+                retention = new { maxBytes = effective.Retention.MaxBytes, maxAgeSeconds = effective.Retention.MaxAge?.TotalSeconds },
+            }).ExecuteAsync(ctx);
+        }
+        catch (ArgumentException ex) { await Error(ctx, 400, ex.Message); }
+        catch (Exception ex) { await Error(ctx, 500, ex.Message); }
+    }
+
+    private static async Task ListTopics(HttpContext ctx, BrokerEngine engine)
+    {
+        var list = engine.Topics.Select(name =>
+        {
+            var cfg = engine.GetTopicConfig(name)!;
+            return new
+            {
+                name,
+                durability = cfg.Durability.ToString(),
+                oldestOffset = engine.OldestOffset(name),
+                endOffset = engine.EndOffset(name),
+                sizeBytes = engine.LogSizeBytes(name),
+            };
+        });
+        await Results.Json(list).ExecuteAsync(ctx);
+    }
+
+    private static async Task DescribeTopic(HttpContext ctx, string topic, BrokerEngine engine)
+    {
+        var cfg = engine.GetTopicConfig(topic);
+        if (cfg is null)
+        {
+            await Error(ctx, 404, $"Topic '{topic}' does not exist.");
+            return;
+        }
+        await Results.Json(new
+        {
+            topic,
+            durability = cfg.Durability.ToString(),
+            retention = new { maxBytes = cfg.Retention.MaxBytes, maxAgeSeconds = cfg.Retention.MaxAge?.TotalSeconds },
+            oldestOffset = engine.OldestOffset(topic),
+            endOffset = engine.EndOffset(topic),
+            sizeBytes = engine.LogSizeBytes(topic),
+        }).ExecuteAsync(ctx);
+    }
+
+    private static async Task SweepNow(HttpContext ctx, BrokerEngine engine)
+    {
+        engine.SweepNow();
+        await Results.Json(new { swept = true }).ExecuteAsync(ctx);
     }
 
     private static async Task Error(HttpContext ctx, int status, string message)
