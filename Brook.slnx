@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/demo/">
+    <Project Path="demo/Brook.Demo/Brook.Demo.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Brook.Client/Brook.Client.csproj" />
+    <Project Path="src/Brook.Core/Brook.Core.csproj" />
+    <Project Path="src/Brook.Server/Brook.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Brook.Tests/Brook.Tests.csproj" />
+  </Folder>
+</Solution>

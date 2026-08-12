@@ -1,4 +1,4 @@
-# HttpBroker
+# Brook
 
 **An HTTP-native message broker — fast because it's simple, safe because its
 failure modes are explicit.**
@@ -42,16 +42,16 @@ Consumer ◀──GET  /v1/topics/{topic}/stream───  append-only segment l
 
 ```powershell
 # 1. serve
-dotnet run --project demo/HttpBroker.Demo -- serve --urls http://127.0.0.1:8123 --data ./data
+dotnet run --project demo/Brook.Demo -- serve --urls http://127.0.0.1:8123 --data ./data
 
 # 2. produce 10k messages
-dotnet run --project demo/HttpBroker.Demo -- produce --url http://127.0.0.1:8123 --topic demo --count 10000
+dotnet run --project demo/Brook.Demo -- produce --url http://127.0.0.1:8123 --topic demo --count 10000
 
 # 3. consume (replay, print, commit every 100 — at-least-once)
-dotnet run --project demo/HttpBroker.Demo -- consume --url http://127.0.0.1:8123 --topic demo --group g1
+dotnet run --project demo/Brook.Demo -- consume --url http://127.0.0.1:8123 --topic demo --group g1
 
 # 4. benchmark
-dotnet run --project demo/HttpBroker.Demo -- bench --url http://127.0.0.1:8123 --topic bench --messages 1000000 --size 64 --batch 500 --workers 8
+dotnet run --project demo/Brook.Demo -- bench --url http://127.0.0.1:8123 --topic bench --messages 1000000 --size 64 --batch 500 --workers 8
 
 # 5. tests
 dotnet test
@@ -84,10 +84,10 @@ curl-debuggable*, not "beats a replicated fsync'd cluster". See
 ## Project layout
 
 ```
-src/HttpBroker.Core     storage engine: SegmentLog, OffsetStore, BrokerEngine, models
-src/HttpBroker.Server   Kestrel host + HTTP/2 endpoints
-src/HttpBroker.Client   C# producer/consumer client library
-demo/HttpBroker.Demo    serve / produce / consume / bench CLI
-tests/HttpBroker.Tests  20 tests: storage, engine semantics, real HTTP end-to-end
+src/Brook.Core     storage engine: SegmentLog, OffsetStore, BrokerEngine, models
+src/Brook.Server   Kestrel host + HTTP/2 endpoints
+src/Brook.Client   C# producer/consumer client library
+demo/Brook.Demo    serve / produce / consume / bench CLI
+tests/Brook.Tests  20 tests: storage, engine semantics, real HTTP end-to-end
 docs/                   the documentation above
 ```

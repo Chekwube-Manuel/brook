@@ -4,7 +4,7 @@ Numbers measured on a single machine against a single broker node. Reproduce
 with the built-in `bench` command:
 
 ```powershell
-dotnet run --project demo/HttpBroker.Demo -- bench `
+dotnet run --project demo/Brook.Demo -- bench `
   --url http://127.0.0.1:8123 --topic bench `
   --messages 1000000 --size 64 --batch 500 --workers 8
 ```

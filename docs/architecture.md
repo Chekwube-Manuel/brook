@@ -1,20 +1,20 @@
 # Architecture
 
-HttpBroker is a single-node, HTTP-native message broker. This document describes
+Brook is a single-node, HTTP-native message broker. This document describes
 the components, the data flow, and the concurrency model that guarantees ordering
 without gaps or duplicates.
 
 ## Components
 
 ```
-┌────────────────────────────── HttpBroker.Server (Kestrel, HTTP/2 h2c) ──────────────────────────────┐
+┌────────────────────────────── Brook.Server (Kestrel, HTTP/2 h2c) ──────────────────────────────┐
 │  /v1/topics/{t}/messages   POST    produce batch ──▶  BrokerEngine.Produce                         │
 │  /v1/topics/{t}/stream     GET     consume        ◀──  BrokerEngine.Subscribe + ReadReplayAsync    │
 │  /v1/groups/...            PUT/GET commit/read offsets ─▶ OffsetStore                             │
 │  /v1/topics/{t}            PUT     configure     ──▶  TopicConfigIO (topic.json)                  │
 └──────────────────────────────────────────┬────────────────────────────────────────────────────────┘
                                             │
-┌──────────────────────────────────────────▼───────────────────────────── HttpBroker.Core ──────────┐
+┌──────────────────────────────────────────▼───────────────────────────── Brook.Core ──────────┐
 │  BrokerEngine                                                          │                          │
 │   ├─ TopicState registry (one per topic)                              │                          │
 │   │    ├─ TopicConfig  (durability, segment size, retention)          │                          │
