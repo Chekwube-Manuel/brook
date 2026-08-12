@@ -10,6 +10,8 @@ namespace HttpBroker.Server;
 /// HTTP endpoints. Wire format is NDJSON for the stream and JSON for everything else.
 ///   POST /v1/topics/{topic}/messages              produce (single object or array)
 ///   GET  /v1/topics/{topic}/stream?group=&offset=  consume (HTTP/2 server-stream)
+///   PUT  /v1/groups/{group}/topics/{topic}/offset  commit offset
+///   GET  /v1/groups/{group}/topics/{topic}/offset  read committed offset
 ///   GET  /healthz
 /// </summary>
 public static class Endpoints
@@ -19,6 +21,8 @@ public static class Endpoints
         app.MapGet("/healthz", () => Results.Text("ok"));
         app.MapPost("/v1/topics/{topic}/messages", Produce);
         app.MapGet("/v1/topics/{topic}/stream", Stream);
+        app.MapPut("/v1/groups/{group}/topics/{topic}/offset", CommitOffset);
+        app.MapGet("/v1/groups/{group}/topics/{topic}/offset", ReadOffset);
     }
 
     // ---------- produce ----------
@@ -137,6 +141,36 @@ public static class Endpoints
         var bytes = Encoding.UTF8.GetBytes(line + "\n");
         await ctx.Response.Body.WriteAsync(bytes, ctx.RequestAborted);
         await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+    }
+
+    // ---------- consumer groups ----------
+
+    private static async Task CommitOffset(HttpContext ctx, string group, string topic, BrokerEngine engine)
+    {
+        try
+        {
+            BrokerEngine.ValidateName(group, "group");
+            using var doc = await JsonDocument.ParseAsync(ctx.Request.Body);
+            if (!doc.RootElement.TryGetProperty("offset", out var p) || !p.TryGetInt64(out var requested))
+                throw new ArgumentException("Body needs an integer 'offset' (the next offset to consume).");
+            if (requested < 0) throw new ArgumentException("Offset must be >= 0.");
+
+            await engine.CommitOffsetAsync(group, topic, requested);
+            await Results.Json(new { group, topic, committed = requested }).ExecuteAsync(ctx);
+        }
+        catch (ArgumentException ex) { await Error(ctx, 400, ex.Message); }
+        catch (Exception ex) { await Error(ctx, 500, ex.Message); }
+    }
+
+    private static async Task ReadOffset(HttpContext ctx, string group, string topic, BrokerEngine engine)
+    {
+        try
+        {
+            BrokerEngine.ValidateName(group, "group");
+            await Results.Json(new { group, topic, offset = engine.GetCommittedOffset(group, topic) }).ExecuteAsync(ctx);
+        }
+        catch (ArgumentException ex) { await Error(ctx, 400, ex.Message); }
+        catch (Exception ex) { await Error(ctx, 500, ex.Message); }
     }
 
     private static async Task Error(HttpContext ctx, int status, string message)
