@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using HttpBroker.Core.Model;
 
@@ -42,7 +43,7 @@ public sealed class SegmentLog : IDisposable
                      .Select(Path.GetFileName)
                      .OrderBy(f => ParseStartOffset(f!)))
         {
-            var seg = Segment.Open(Path.Combine(dir, file!), ParseStartOffset(file!), isActive: false);
+            var seg = Segment.Open(ResolveSegmentPath(dir, file!), ParseStartOffset(file!), isActive: false);
             log._segments.Add(seg);
         }
 
@@ -60,8 +61,25 @@ public sealed class SegmentLog : IDisposable
 
     private static long ParseStartOffset(string fileName)
     {
+        // Strict, culture-invariant digits only: seg-<non-negative int64>.log.
+        // Rejects signs, whitespace, and grouping so a hostile file name can never
+        // influence the resolved path (CWE-22, zip-slip).
         var digits = fileName["seg-".Length..^(".log".Length)];
-        return long.Parse(digits);
+        if (!long.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var start) || start < 0)
+            throw new InvalidDataException($"Segment file '{fileName}' has an invalid start offset.");
+        return start;
+    }
+
+    /// <summary>Resolve a candidate segment path and verify it stays inside the topic
+    /// directory. Without this containment check, a crafted file name could make
+    /// <see cref="Path.Combine"/> point outside <paramref name="dir"/>.</summary>
+    private static string ResolveSegmentPath(string dir, string fileName)
+    {
+        var full = Path.GetFullPath(Path.Combine(dir, fileName));
+        var root = Path.GetFullPath(dir);
+        if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            throw new InvalidDataException($"Segment file '{fileName}' escapes the topic directory.");
+        return full;
     }
 
     public long NextOffset
