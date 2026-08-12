@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using HttpBroker.Client;
 using HttpBroker.Server;
 
@@ -8,6 +9,7 @@ namespace HttpBroker.Demo;
 ///   serve    --urls http://host:port --data ./data        run the broker
 ///   produce  --url ... --topic demo --count 1000          push text messages
 ///   consume  --url ... --topic demo --group g1            print + commit, at-least-once
+///   bench    --url ... --topic bench --messages 100k --size 128 --batch 100 --workers 8
 /// </summary>
 public static class Program
 {
@@ -27,6 +29,7 @@ public static class Program
                 "serve" => await ServeAsync(),
                 "produce" => await ProduceAsync(),
                 "consume" => await ConsumeAsync(),
+                "bench" => await BenchAsync(),
                 _ => PrintUsage(),
             };
         }
@@ -141,6 +144,45 @@ public static class Program
         return 0;
     }
 
+    // ---------- bench ----------
+
+    private static async Task<int> BenchAsync()
+    {
+        using var client = new BrokerClient(Opt("url", "http://127.0.0.1:8123"));
+        var topic = Opt("topic", "bench");
+        var total = OptLong("messages", 100_000);
+        var size = OptInt("size", 128);
+        var batch = OptInt("batch", 100);
+        var workers = OptInt("workers", 8);
+        var payload = new string('x', size);
+
+        Console.WriteLine($"[bench] {total:N0} messages x {size} B, batch {batch}, workers {workers} on '{topic}'");
+        var sw = Stopwatch.StartNew();
+        var latencies = new ConcurrentBag<double>();
+
+        await Task.WhenAll(Enumerable.Range(0, workers).Select(async _ =>
+        {
+            for (long i = 0; i < total; i += batch)
+            {
+                var n = (int)Math.Min(batch, total - i);
+                var batchMsgs = Enumerable.Range(0, n).Select(i => payload).ToArray();
+                var t = Stopwatch.StartNew();
+                await client.ProduceAsync(topic, batchMsgs);
+                t.Stop();
+                latencies.Add(t.Elapsed.TotalMicroseconds / n);
+            }
+        }));
+        sw.Stop();
+
+        var sorted = latencies.OrderBy(x => x).ToArray();
+        Console.WriteLine($"[bench] {total:N0} msgs in {sw.Elapsed.TotalSeconds:F2}s = {total / sw.Elapsed.TotalSeconds:N0} msg/s");
+        Console.WriteLine($"[bench] batch latency p50 {Pct(sorted, 0.50):F0} µs · p99 {Pct(sorted, 0.99):F0} µs");
+        return 0;
+    }
+
+    private static double Pct(double[] sorted, double q)
+        => sorted.Length == 0 ? 0 : sorted[(int)((sorted.Length - 1) * q)];
+
     private static int PrintUsage()
     {
         Console.WriteLine("""
@@ -148,6 +190,7 @@ public static class Program
               serve    --urls http://127.0.0.1:8123 --data ./data
               produce  --url http://127.0.0.1:8123 --topic demo --count 1000 [--size 64]
               consume  --url http://127.0.0.1:8123 --topic demo --group g1 [--commit-every 100]
+              bench    --url http://127.0.0.1:8123 --topic bench --messages 100000 [--size 128] [--batch 100] [--workers 8]
             """);
         return 1;
     }
