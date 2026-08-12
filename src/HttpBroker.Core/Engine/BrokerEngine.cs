@@ -55,11 +55,14 @@ public sealed class ConsumerSubscription
 public sealed class BrokerEngine : IAsyncDisposable
 {
     public const int DefaultPort = 8123;
+    private static readonly TimeSpan SweepInterval = TimeSpan.FromSeconds(30);
 
     private readonly string _dataDir;
     private readonly string _topicsDir;
     private readonly ConcurrentDictionary<string, TopicState> _topics = new(StringComparer.Ordinal);
     private readonly OffsetStore _offsets;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly Task _sweepLoop;
 
     private sealed class TopicState(TopicConfig config, SegmentLog log)
     {
@@ -77,6 +80,8 @@ public sealed class BrokerEngine : IAsyncDisposable
 
         _offsets = new OffsetStore(Path.Combine(_dataDir, "offsets.log"));
         ReopenExistingTopics();
+
+        _sweepLoop = Task.Run(SweepLoopAsync);
     }
 
     private void ReopenExistingTopics()
@@ -206,15 +211,47 @@ public sealed class BrokerEngine : IAsyncDisposable
 
     public long GetCommittedOffset(string group, string topic) => _offsets.Get(group, topic);
 
-    public async ValueTask DisposeAsync()
+    /// <summary>Run retention sweep on every topic immediately (also runs in the background).</summary>
+    public void SweepNow()
     {
         foreach (var state in _topics.Values)
+            state.Log.Sweep();
+    }
+
+    private async Task SweepLoopAsync()
+    {
+        using var timer = new PeriodicTimer(SweepInterval);
+        while (!_cts.IsCancellationRequested)
         {
+            await timer.WaitForNextTickAsync(_cts.Token);
+            try
+            {
+                foreach (var state in _topics.Values)
+                    state.Log.Sweep();
+            }
+            catch (Exception) { /* keep sweeping; a failing topic must not kill the loop */ }
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        try { await _sweepLoop.WaitAsync(TimeSpan.FromSeconds(2)); } catch { /* noop */ }
+
+        foreach (var state in _topics.Values)
+        {
+            lock (state.FanoutLock)
+            {
+                foreach (var sub in state.Subs)
+                    sub.Close();
+                state.Subs.Clear();
+            }
             state.Log.FlushFinal();
             state.Log.Dispose();
         }
 
         _offsets.Dispose();
+        _cts.Dispose();
     }
 }
 
