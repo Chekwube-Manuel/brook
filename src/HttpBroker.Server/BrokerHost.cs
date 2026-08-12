@@ -18,8 +18,14 @@ public static class BrokerHost
             // automatically; curl needs --http2-prior-knowledge. Kept HTTP/2-only so the
             // streaming protocol is never silently downgraded to HTTP/1.1.
             var uri = new Uri(url);
+            var port = uri.Port == 0 ? 0 : uri.Port;
             var options = (ListenOptions lo) => { lo.Protocols = HttpProtocols.Http2; };
-            kestrel.ListenLocalhost(uri.Port, options);
+            if (uri.Host is "localhost" or "127.0.0.1")
+                kestrel.Listen(System.Net.IPAddress.Loopback, port, options);
+            else if (uri.Host == "[::1]")
+                kestrel.Listen(System.Net.IPAddress.IPv6Loopback, port, options);
+            else
+                kestrel.ListenAnyIP(port, options);
         });
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         builder.Services.AddSingleton(new BrokerEngine(dataDir));
