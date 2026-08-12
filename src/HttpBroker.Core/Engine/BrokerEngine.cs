@@ -63,6 +63,7 @@ public sealed class BrokerEngine : IAsyncDisposable
     private readonly OffsetStore _offsets;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _sweepLoop;
+    private readonly object _createLock = new();
 
     private sealed class TopicState(TopicConfig config, SegmentLog log)
     {
@@ -111,24 +112,34 @@ public sealed class BrokerEngine : IAsyncDisposable
 
     private TopicState GetOrCreate(string topic, TopicConfig? config = null)
     {
-        return _topics.GetOrAdd(topic, name =>
+        if (_topics.TryGetValue(topic, out var existing)) return existing;
+
+        // GetOrAdd would run the factory once per racing caller and let the losers
+        // throw away a fully opened log. Take the lock so exactly one thread creates.
+        lock (_createLock)
         {
-            ValidateName(name, "topic");
-            var cfg = config is null ? TopicConfig.Default(name) : config.Clone();
-            cfg.Name = name;
-            var dir = Path.Combine(_topicsDir, name);
+            if (_topics.TryGetValue(topic, out existing)) return existing;
+
+            ValidateName(topic, "topic");
+            var cfg = config is null ? TopicConfig.Default(topic) : config.Clone();
+            cfg.Name = topic;
+            var dir = Path.Combine(_topicsDir, topic);
             Directory.CreateDirectory(dir);
             TopicConfigIO.Save(dir, cfg);
-            return new TopicState(cfg, SegmentLog.Open(dir, cfg));
-        });
+            var state = new TopicState(cfg, SegmentLog.Open(dir, cfg));
+            _topics[topic] = state;
+            return state;
+        }
     }
 
     /// <summary>Configure (create-or-update) a topic. Updates apply to future appends.</summary>
     public TopicConfig ConfigureTopic(string topic, TopicConfig config)
     {
         var state = GetOrCreate(topic, config);
-        TopicConfigIO.Save(Path.Combine(_topicsDir, topic), state.Config);
-        return state.Config;
+        config.Name = topic;
+        TopicConfigIO.Save(Path.Combine(_topicsDir, topic), config);
+        state.Config = config;
+        return config;
     }
 
     public TopicConfig? GetTopicConfig(string topic)
