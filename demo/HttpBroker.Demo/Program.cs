@@ -159,12 +159,16 @@ public static class Program
         Console.WriteLine($"[bench] {total:N0} messages x {size} B, batch {batch}, workers {workers} on '{topic}'");
         var sw = Stopwatch.StartNew();
         var latencies = new ConcurrentBag<double>();
+        var remaining = total;
 
         await Task.WhenAll(Enumerable.Range(0, workers).Select(async _ =>
         {
-            for (long i = 0; i < total; i += batch)
+            while (true)
             {
-                var n = (int)Math.Min(batch, total - i);
+                var n = (int)Math.Min(batch, Interlocked.Read(ref remaining));
+                if (n <= 0) break;
+                Interlocked.Add(ref remaining, -n);
+
                 var batchMsgs = Enumerable.Range(0, n).Select(i => payload).ToArray();
                 var t = Stopwatch.StartNew();
                 await client.ProduceAsync(topic, batchMsgs);
