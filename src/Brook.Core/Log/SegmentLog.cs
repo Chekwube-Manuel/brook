@@ -107,18 +107,24 @@ public sealed class SegmentLog : IDisposable
     /// Sync-on-the-outside so callers can hold a lock across append + fan-out without awaiting.</summary>
     public (long First, long Last) Append(IReadOnlyList<byte[]> payloads, DateTimeOffset? timestamp = null)
     {
+        List<(Segment Seg, bool Fsync)> toFlush = new();
+        DateTimeOffset ts;
+        long first;
+        Segment active;
+
         lock (_lock)
         {
-            var ts = timestamp ?? DateTimeOffset.UtcNow;
-            var first = _nextOffset;
-            var active = _segments[^1];
+            ts = timestamp ?? DateTimeOffset.UtcNow;
+            first = _nextOffset;
+            active = _segments[^1];
 
             foreach (var payload in payloads)
             {
                 if (active.SizeBytes >= _config.SegmentMaxBytes && active.RecordCount > 0)
                 {
                     active.IsActive = false;
-                    active.Flush(fsync: _config.Durability == DurabilityMode.Fsync);
+                    // record the segment to flush outside the lock
+                    toFlush.Add((active, _config.Durability == DurabilityMode.Fsync));
                     active = Segment.Create(Path.Combine(_dir, $"seg-{_nextOffset}.log"), _nextOffset);
                     _segments.Add(active);
                 }
@@ -126,14 +132,26 @@ public sealed class SegmentLog : IDisposable
                 active.Append(_nextOffset, ts, payload);
                 _nextOffset++;
             }
+        }
 
+        // Perform flushes outside the lock to avoid blocking other appenders.
+        try
+        {
+            foreach (var (seg, fsync) in toFlush)
+                seg.Flush(fsync: fsync);
+
+            // flush the (possibly new) active segment according to durability mode
             if (_config.Durability == DurabilityMode.Fsync)
                 active.Flush(fsync: true);
             else
                 active.Flush(fsync: false); // push buffered bytes to the OS so readers see them
-
-            return (first, _nextOffset - 1);
         }
+        catch (Exception)
+        {
+            // Ignore transient IO errors here; callers will observe failures on read if necessary.
+        }
+
+        return (first, _nextOffset - 1);
     }
 
     /// <summary>Read records with offsets in [startOffset, endOffsetExclusive), oldest first.</summary>

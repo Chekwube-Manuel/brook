@@ -181,7 +181,7 @@ public static class Endpoints
         });
         var bytes = Encoding.UTF8.GetBytes(line + "\n");
         await ctx.Response.Body.WriteAsync(bytes, ctx.RequestAborted);
-        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+        // removed per-message FlushAsync to allow batching in the HTTP stack / kernel
     }
 
     private static async Task WriteBinaryFrameAsync(HttpContext ctx, BrokerMessage m)
@@ -189,7 +189,7 @@ public static class Endpoints
         // Binary frame: [int64 offset][int64 timestamp_ms][int32 len][payload]
         var frame = BinaryCodec.EncodeMessage(m);
         await ctx.Response.Body.WriteAsync(frame, ctx.RequestAborted);
-        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+        // removed per-message FlushAsync to allow batching in the HTTP stack / kernel
     }
 
     // ---------- consumer groups ----------
