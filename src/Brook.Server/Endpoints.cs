@@ -82,25 +82,37 @@ public static class Endpoints
 
     private static async Task<IReadOnlyList<byte[]>> DecodeJsonBatch(HttpContext ctx)
     {
-        using var doc = await JsonDocument.ParseAsync(ctx.Request.Body);
-        var root = doc.RootElement;
         var batch = new List<byte[]>(8);
 
-        void Add(JsonElement item)
+        // Use DeserializeAsyncEnumerable<JsonElement> to stream elements out of the request body
+        // without building a full DOM for large arrays.
+        await foreach (var elem in JsonSerializer.DeserializeAsyncEnumerable<JsonElement>(ctx.Request.Body, JsonOpts))
         {
-            var payload = item.ValueKind == JsonValueKind.String ? item.GetString()
-                : item.TryGetProperty("payload", out var p) ? p.GetString()
-                : null;
-            if (payload is null)
-                throw new ArgumentException("Each message needs a string 'payload'.");
-            batch.Add(Encoding.UTF8.GetBytes(payload));
+            switch (elem.ValueKind)
+            {
+                case JsonValueKind.String:
+                    var s = elem.GetString();
+                    if (s is null) throw new ArgumentException("Each message needs a string 'payload'.");
+                    batch.Add(Encoding.UTF8.GetBytes(s));
+                    break;
+                case JsonValueKind.Object:
+                    if (elem.TryGetProperty("payload", out var p) && p.ValueKind == JsonValueKind.String)
+                    {
+                        batch.Add(Encoding.UTF8.GetBytes(p.GetString()!));
+                    }
+                    else
+                    {
+                        throw new ArgumentException("Each message needs a string 'payload'.");
+                    }
+                    break;
+                default:
+                    throw new ArgumentException("Body must be a message object or an array of them.");
+            }
         }
 
-        if (root.ValueKind == JsonValueKind.Array)
-            foreach (var item in root.EnumerateArray()) Add(item);
-        else if (root.ValueKind is JsonValueKind.Object or JsonValueKind.String)
-            Add(root);
-        else
+        // If the body was a single JSON object or string, DeserializeAsyncEnumerable yields one element.
+        // If nothing was produced the body was empty => error.
+        if (batch.Count == 0)
             throw new ArgumentException("Body must be a message object or an array of them.");
 
         return batch;
