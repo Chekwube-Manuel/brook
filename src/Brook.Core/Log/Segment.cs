@@ -8,12 +8,14 @@ namespace Brook.Core.Log;
 /// One append-only file on disk holding consecutive records.
 /// File name: seg-{StartOffset}.log  ·  Record layout (little-endian):
 ///   [int32 payload length][int64 timestamp ms][payload bytes]
-/// An in-memory position index is rebuilt by scanning the file on open.
+/// An in-memory position index is rebuilt by scanning the file on open,
+/// or loaded from a sidecar index file seg-{StartOffset}.idx (binary int64 positions).
 /// </summary>
-public sealed class Segment
+public sealed class Segment : IDisposable
 {
     private readonly FileStream _writeStream;
     private FileStream? _readStream; // reused read-only handle for low-overhead reads
+    private FileStream? _indexStream; // sidecar index stream (append-only, binary int64 positions)
     private readonly List<long> _positions = new();
 
     public string Path { get; }
@@ -35,6 +37,8 @@ public sealed class Segment
         LastWriteUtc = File.GetLastWriteTimeUtc(path);
     }
 
+    private static string IndexPathFor(string path) => Path.ChangeExtension(path, ".idx");
+
     public static Segment Create(string path, long startOffset)
     {
         var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite,
@@ -43,10 +47,14 @@ public sealed class Segment
         // create a read-only handle for efficient reads
         seg._readStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
             bufferSize: 64 * 1024, FileOptions.SequentialScan);
+        // create/open index sidecar for appending positions
+        var idxPath = IndexPathFor(path);
+        seg._indexStream = new FileStream(idxPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read,
+            bufferSize: 8 * 1024, FileOptions.SequentialScan);
         return seg;
     }
 
-    /// <summary>Open an existing file and rebuild the record index by scanning.</summary>
+    /// <summary>Open an existing file and rebuild the record index by scanning or by reading a sidecar index file.</summary>
     public static Segment Open(string path, long startOffset, bool isActive)
     {
         var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite,
@@ -55,18 +63,70 @@ public sealed class Segment
         // separate read-only handle used for reads and scanning
         seg._readStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
             bufferSize: 64 * 1024, FileOptions.SequentialScan);
-        seg.ScanIndex();
+
+        var idxPath = IndexPathFor(path);
+        if (File.Exists(idxPath))
+        {
+            try
+            {
+                // Attempt to read the index file; if it succeeds and seems consistent, use it.
+                seg._indexStream = new FileStream(idxPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read,
+                    bufferSize: 8 * 1024, FileOptions.SequentialScan);
+                if (!seg.TryLoadIndexFromSidecar())
+                {
+                    // Index file mismatched; rebuild index and replace sidecar.
+                    seg._indexStream.Dispose();
+                    seg._indexStream = null;
+                    seg.ScanIndexAndWriteSidecar();
+                }
+            }
+            catch
+            {
+                // Any index read error -> rebuild by scanning
+                try { seg._indexStream?.Dispose(); } catch { }
+                seg._indexStream = null;
+                seg.ScanIndexAndWriteSidecar();
+            }
+        }
+        else
+        {
+            // No sidecar: scan and write the idx for future opens.
+            seg.ScanIndexAndWriteSidecar();
+        }
+
         return seg;
     }
 
-    private void ScanIndex()
+    private bool TryLoadIndexFromSidecar()
     {
-        // Use the read-only stream for scanning so we don't interfere with the writer
-        if (_readStream is null)
-            throw new InvalidOperationException("Read stream not initialized for scanning.");
+        if (_indexStream is null) return false;
+        // index file is sequence of little-endian int64 positions
+        var length = _indexStream.Length;
+        if (length % 8 != 0) return false;
+        var count = (int)(length / 8);
+        _positions.Clear();
+        _indexStream.Position = 0;
+        var buf = new byte[8];
+        for (int i = 0; i < count; i++)
+        {
+            int read = _indexStream.Read(buf, 0, 8);
+            if (read != 8) return false;
+            var pos = BinaryPrimitives.ReadInt64LittleEndian(buf);
+            // validate position within file bounds
+            if (pos < 0 || pos >= _writeStream.Length) return false;
+            _positions.Add(pos);
+        }
 
-        _readStream.Position = 0;
-        Span<byte> header = stackalloc byte[12];
+        // position index stream at end for appends
+        _indexStream.Position = _indexStream.Length;
+        return true;
+    }
+
+    private void ScanIndexAndWriteSidecar()
+    {
+        // Scan the file to build positions
+        _positions.Clear();
+        _readStream!.Position = 0;
         using var reader = new BinaryReader(_readStream, Encoding.UTF8, leaveOpen: true);
         while (_readStream.Position < _readStream.Length)
         {
@@ -76,19 +136,50 @@ public sealed class Segment
                 throw new InvalidDataException($"Corrupt segment {Path}: bad record length {len} at position {_readStream.Position - 4}.");
             _readStream.Position += 8L + len; // timestamp + payload
         }
+
+        // Write the sidecar (atomically replace if exists)
+        var idxPath = IndexPathFor(Path);
+        var tmp = idxPath + ".tmp";
+        using (var w = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 8 * 1024))
+        {
+            var buf = new byte[8];
+            foreach (var p in _positions)
+            {
+                BinaryPrimitives.WriteInt64LittleEndian(buf, p);
+                w.Write(buf, 0, 8);
+            }
+            w.Flush(flushToDisk: false);
+        }
+        File.Replace(tmp, idxPath, null);
+        // open index stream for append/read
+        _indexStream = new FileStream(idxPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read,
+            bufferSize: 8 * 1024, FileOptions.SequentialScan);
+        _indexStream.Position = _indexStream.Length;
     }
 
     /// <summary>Append one record. Caller must guarantee no concurrent writers and
     /// that offset == EndOffset.</summary>
     public void Append(long offset, DateTimeOffset timestamp, ReadOnlySpan<byte> payload)
     {
-        _positions.Add(_writeStream.Position);
+        // record on-disk write position before writing data
+        var pos = _writeStream.Position;
+        _positions.Add(pos);
+
         Span<byte> header = stackalloc byte[12];
         BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
         BinaryPrimitives.WriteInt64LittleEndian(header[4..], timestamp.ToUnixTimeMilliseconds());
         _writeStream.Write(header);
         if (!payload.IsEmpty) _writeStream.Write(payload);
         LastWriteUtc = DateTimeOffset.UtcNow;
+
+        // Append position to sidecar index for fast open next time
+        if (_indexStream != null)
+        {
+            Span<byte> b = stackalloc byte[8];
+            BinaryPrimitives.WriteInt64LittleEndian(b, pos);
+            _indexStream.Write(b);
+            // Don't flush to disk here for perf; the normal flush path will make data visible.
+        }
     }
 
     /// <summary>Flush buffered bytes to the OS. <paramref name="fsync"/> additionally
@@ -97,6 +188,11 @@ public sealed class Segment
     {
         _writeStream.Flush();
         if (fsync) _writeStream.Flush(flushToDisk: true);
+        if (_indexStream != null)
+        {
+            _indexStream.Flush();
+            if (fsync) _indexStream.Flush(flushToDisk: true);
+        }
     }
 
     /// <summary>Read record <paramref name="recordIndex"/> (0-based within this segment).
@@ -160,6 +256,9 @@ public sealed class Segment
     {
         try { _writeStream.Dispose(); } catch { }
         try { _readStream?.Dispose(); } catch { }
+        try { _indexStream?.Dispose(); } catch { }
+        var idxPath = IndexPathFor(Path);
+        try { File.Delete(idxPath); } catch { }
         File.Delete(Path);
     }
 
@@ -167,5 +266,6 @@ public sealed class Segment
     {
         _writeStream.Dispose();
         _readStream?.Dispose();
+        _indexStream?.Dispose();
     }
 }
